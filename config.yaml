@@ -1,0 +1,48 @@
+# Настройки агента. Относительные пути считаются от папки, где лежит этот файл.
+
+# Куда складывать записи, расшифровки и конспекты
+output_dir: lectures
+
+audio:
+  # Номер микрофона из `python agent.py devices`. null = микрофон по умолчанию
+  device: null
+  # Whisper хватает 16 кГц, так файлы получаются меньше
+  samplerate: 16000
+
+transcription:
+  # Модель Whisper. Чем больше, тем точнее, но медленнее:
+  #   small           быстрая, нормально работает на обычном ноутбуке
+  #   medium          заметно точнее, примерно в 2-3 раза медленнее
+  #   large-v3-turbo  самая точная из разумных, лучше всего с видеокартой NVIDIA
+  model: small
+  # Язык пары. null = определять автоматически
+  language: ru
+  # cpu или cuda (для cuda нужна видеокарта NVIDIA и установленные CUDA 12 + cuDNN 9)
+  device: cpu
+  # auto = int8 на процессоре, float16 на видеокарте
+  compute_type: auto
+
+summary:
+  # Ключ к Claude API берётся из переменной окружения ANTHROPIC_API_KEY.
+  # Вписывать его сюда не нужно: этот файл лежит в репозитории.
+  enabled: true
+  model: claude-sonnet-5
+  # Сколько Claude "думает": low / medium / high. medium вполне хватает для конспектов
+  effort: medium
+  max_tokens: 32000
+  # Свои пожелания к конспекту, например: "Пиши короче" или "Добавляй примеры кода на Python"
+  extra_instructions: ""
+
+# Приём записей из расширения для браузера (python agent.py serve)
+server:
+  port: 8756
+  # Название предмета, если в расширении его не вписали
+  default_subject: Онлайн-пара
+
+# Файл с расписанием
+schedule_file: schedule.yaml
+
+schedule:
+  # Начинать запись на столько минут раньше и заканчивать на столько позже
+  start_early_min: 2
+  extra_min: 5

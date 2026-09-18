@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Запись пар (lecture-agent)",
+  "version": "1.0.0",
+  "description": "Записывает звук выбранной вкладки и отдаёт запись агенту, который делает конспект.",
+  "permissions": ["tabCapture", "offscreen", "storage", "downloads", "tabs"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "Запись пары",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+  },
+  "icons": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+}

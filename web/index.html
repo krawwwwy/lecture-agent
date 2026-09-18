@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Пары</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #eef1f4;
+  --surface: #ffffff;
+  --sunken: #f5f7f9;
+  --ink: #16202a;
+  --muted: #5d6b7a;
+  --rule: #d9e0e7;
+  --steel: #1f6f8b;
+  --signal: #d4452a;
+  --done: #4b8f6b;
+  --radius: 10px;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f151b;
+    --surface: #18212a;
+    --sunken: #131b23;
+    --ink: #e4ebf2;
+    --muted: #8697a7;
+    --rule: #26333f;
+    --steel: #58b0cc;
+    --signal: #ef6a4e;
+    --done: #6fbf94;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 15px/1.5 "IBM Plex Sans", system-ui, "Segoe UI", sans-serif;
+  padding-bottom: 96px;
+}
+.mono { font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace; }
+.wrap { max-width: 760px; margin: 0 auto; padding: 0 16px; }
+
+/* ---------- шапка ---------- */
+header {
+  position: sticky; top: 0; z-index: 20;
+  background: var(--surface);
+  border-bottom: 1px solid var(--rule);
+}
+.bar { display: flex; align-items: baseline; gap: 12px; padding: 14px 0 12px; }
+.group { font-weight: 600; font-size: 17px; letter-spacing: -.01em; }
+.sub { color: var(--muted); font-size: 13px; }
+.clock { margin-left: auto; font-size: 20px; font-weight: 500; letter-spacing: .02em; }
+.clock small { display: block; font-size: 11px; color: var(--muted); letter-spacing: 0; text-align: right; font-family: "IBM Plex Sans", sans-serif; }
+nav { display: flex; gap: 20px; }
+nav button {
+  border: 0; background: none; color: var(--muted); font: inherit; font-size: 14px;
+  padding: 0 0 10px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+nav button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--steel); font-weight: 500; }
+nav button:focus-visible { outline: 2px solid var(--steel); outline-offset: 3px; }
+
+/* ---------- полоса недели ---------- */
+.week { display: flex; align-items: center; gap: 4px; padding: 14px 0 6px; }
+.week .days { display: flex; gap: 4px; flex: 1; }
+.arrow {
+  border: 1px solid var(--rule); background: var(--surface); color: var(--muted);
+  width: 30px; height: 46px; border-radius: var(--radius); cursor: pointer; font-size: 15px;
+}
+.day {
+  flex: 1; border: 1px solid transparent; background: var(--surface); border-radius: var(--radius);
+  padding: 6px 2px 5px; text-align: center; cursor: pointer; color: var(--ink);
+  font: inherit; min-width: 0;
+}
+.day span { display: block; font-size: 11px; color: var(--muted); }
+.day b { font-weight: 500; font-size: 16px; font-family: "IBM Plex Mono", monospace; }
+.day .dots { height: 5px; margin-top: 3px; display: flex; gap: 2px; justify-content: center; }
+.day .dots i { width: 4px; height: 4px; border-radius: 50%; background: var(--rule); }
+.day .dots i.rec { background: var(--done); }
+.day[aria-pressed="true"] { border-color: var(--steel); }
+.day.today b { color: var(--steel); }
+
+/* ---------- ось дня ---------- */
+.axis { padding: 8px 0 32px; }
+.slot { display: grid; grid-template-columns: 58px 1fr; gap: 14px; }
+.time { text-align: right; padding-top: 14px; font-size: 13px; color: var(--muted); }
+.time i { display: block; font-style: normal; font-size: 11px; opacity: .75; }
+.track { border-left: 1px solid var(--rule); padding: 0 0 14px 14px; position: relative; }
+.track::before {
+  content: ""; position: absolute; left: -4.5px; top: 18px;
+  width: 8px; height: 8px; border-radius: 50%; background: var(--rule);
+}
+.slot.now .track::before { background: var(--signal); box-shadow: 0 0 0 4px color-mix(in srgb, var(--signal) 22%, transparent); }
+.slot.past .time, .slot.past .card .name { opacity: .62; }
+
+.card { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); padding: 12px 14px; }
+.slot.now .card { border-color: var(--signal); }
+.name { font-weight: 500; line-height: 1.35; }
+.meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; align-items: center; }
+.tag { font-size: 12px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--rule); color: var(--muted); }
+.tag.here { color: var(--steel); border-color: color-mix(in srgb, var(--steel) 45%, var(--rule)); }
+.tag.ready { color: var(--done); border-color: color-mix(in srgb, var(--done) 45%, var(--rule)); }
+
+button.act {
+  font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 99px; cursor: pointer;
+  border: 1px solid var(--steel); background: var(--steel); color: #fff;
+}
+button.act.ghost { background: none; color: var(--steel); }
+button.act.stop { background: var(--signal); border-color: var(--signal); }
+button.act:disabled { opacity: .5; cursor: default; }
+button.act:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+button.act.join { background: #1ab35a; border-color: #1ab35a; gap: 6px; display: inline-flex; align-items: center; }
+button.act.join svg { flex: none; }
+.dock-join { margin-top: 6px; }
+.dock-join a {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: #1ab35a; color: #fff; text-decoration: none;
+  font: 600 14px/1 "IBM Plex Sans", sans-serif;
+  padding: 9px 16px; border-radius: 99px;
+}
+.dock-join a svg { flex: none; }
+
+.empty { color: var(--muted); padding: 30px 4px; }
+.empty b { display: block; color: var(--ink); font-weight: 500; margin-bottom: 4px; }
+
+/* ---------- конспекты ---------- */
+.list { padding: 16px 0 40px; display: flex; flex-direction: column; gap: 8px; }
+.row {
+  display: flex; gap: 12px; align-items: center; width: 100%; text-align: left;
+  background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius);
+  padding: 11px 14px; font: inherit; color: var(--ink); cursor: pointer;
+}
+.row .when { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.row .grow { min-width: 0; flex: 1; }
+.row .grow div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.reader { padding: 18px 0 40px; }
+.reader h1 { font-size: 22px; line-height: 1.25; margin: 18px 0 10px; letter-spacing: -.01em; }
+.reader h2 { font-size: 17px; margin: 24px 0 8px; padding-bottom: 5px; border-bottom: 1px solid var(--rule); }
+.reader h3 { font-size: 15px; margin: 18px 0 6px; }
+.reader p, .reader li { max-width: 68ch; }
+.reader code { background: var(--sunken); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+.reader pre { background: var(--sunken); padding: 12px; border-radius: var(--radius); overflow-x: auto; }
+.reader blockquote { margin: 12px 0; padding-left: 12px; border-left: 2px solid var(--steel); color: var(--muted); }
+.reader .tex { font-family: "IBM Plex Mono", monospace; background: var(--sunken); padding: 0 4px; border-radius: 4px; }
+.reader .stamp { color: var(--steel); font-family: "IBM Plex Mono", monospace; font-size: 12px; }
+.reader .raw { white-space: pre-wrap; font-size: 14px; line-height: 1.7; }
+.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+.toolbar .path { font-size: 12px; color: var(--muted); margin-left: auto; }
+audio { width: 100%; margin-top: 14px; }
+
+/* ---------- нижняя панель ---------- */
+.dock {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+  background: var(--surface); border-top: 1px solid var(--rule);
+}
+.dock .wrap { display: flex; align-items: center; gap: 14px; padding: 12px 16px; }
+.dock .grow { flex: 1; min-width: 0; }
+.dock .label { font-size: 13px; color: var(--muted); }
+.dock .headline { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timer { font-family: "IBM Plex Mono", monospace; font-size: 20px; font-weight: 500; color: var(--signal); }
+.level { display: flex; gap: 2px; height: 14px; align-items: flex-end; margin-top: 4px; }
+.level i { width: 3px; background: var(--rule); border-radius: 1px; height: 100%; }
+.level i.on { background: var(--signal); }
+.pulse { width: 9px; height: 9px; border-radius: 50%; background: var(--signal); flex: none; }
+@media (prefers-reduced-motion: no-preference) { .pulse { animation: blink 1.6s ease-in-out infinite; } }
+@keyframes blink { 50% { opacity: .25; } }
+.hidden { display: none !important; }
+
+@media (max-width: 520px) {
+  .slot { grid-template-columns: 46px 1fr; gap: 10px; }
+  .clock { font-size: 17px; }
+  .day b { font-size: 15px; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="bar">
+      <span class="group" id="group">Расписание</span>
+      <span class="sub" id="subgroup"></span>
+      <span class="clock mono" id="clock">--:--<small>Москва</small></span>
+    </div>
+    <nav>
+      <button id="tab-schedule" aria-selected="true">Расписание</button>
+      <button id="tab-notes" aria-selected="false">Конспекты</button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <section id="view-schedule">
+    <div class="week">
+      <button class="arrow" id="prev" title="Предыдущая неделя">‹</button>
+      <div class="days" id="days"></div>
+      <button class="arrow" id="next" title="Следующая неделя">›</button>
+    </div>
+    <div class="axis" id="axis"></div>
+  </section>
+
+  <section id="view-notes" class="hidden">
+    <div class="list" id="lectures"></div>
+  </section>
+
+  <section id="view-reader" class="hidden">
+    <div class="reader">
+      <div class="toolbar">
+        <button class="act ghost" id="back">Назад</button>
+        <button class="act ghost" id="toggle-raw">Расшифровка</button>
+        <span class="path mono" id="path"></span>
+      </div>
+      <div id="note-body"></div>
+      <audio id="player" controls preload="none" class="hidden"></audio>
+    </div>
+  </section>
+</main>
+
+<div class="dock hidden" id="dock">
+  <div class="wrap">
+    <span class="pulse" id="pulse"></span>
+    <div class="grow">
+      <div class="headline" id="dock-title">Готов к записи</div>
+      <div class="label" id="dock-note"></div>
+      <div class="level hidden" id="level"></div>
+    </div>
+    <span class="timer hidden" id="timer">00:00</span>
+    <div class="dock-join hidden" id="dock-join"></div>
+    <button class="act" id="dock-action">Записать пару</button>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const joinIcon = `<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M5 2H2a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M8 1h4m0 0v4m0-4L6 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const api = async (path, options) => {
+  const res = await fetch(path, options);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+};
+const pad = (n) => String(n).padStart(2, "0");
+const hms = (s) => (s >= 3600 ? `${Math.floor(s / 3600)}:` : "") + `${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`;
+
+let weekOffset = 0;
+let selected = null;   // выбранный день, ISO
+let weekData = null;
+let state = null;
+let showRaw = false;
+let lecture = null;
+
+/* ---------- расписание ---------- */
+
+async function loadWeek(offset) {
+  weekOffset = offset;
+  weekData = await api(`/api/week?offset=${offset}`);
+  const today = weekData.days.find((d) => d.today);
+  if (!selected || !weekData.days.some((d) => d.date === selected)) {
+    selected = (today || weekData.days[0]).date;
+  }
+  drawWeek();
+  drawDay();
+}
+
+function drawWeek() {
+  const box = $("days");
+  box.innerHTML = "";
+  for (const day of weekData.days) {
+    const el = document.createElement("button");
+    el.className = "day" + (day.today ? " today" : "");
+    el.setAttribute("aria-pressed", String(day.date === selected));
+    el.innerHTML = `<span>${day.weekday.slice(0, 2)}</span><b>${day.day}</b>`;
+    const dots = document.createElement("span");
+    dots.className = "dots";
+    for (const pair of day.pairs) {
+      const dot = document.createElement("i");
+      if (pair.recorded) dot.className = "rec";
+      dots.appendChild(dot);
+    }
+    el.appendChild(dots);
+    el.onclick = () => { selected = day.date; drawWeek(); drawDay(); };
+    box.appendChild(el);
+  }
+}
+
+function drawDay() {
+  const day = weekData.days.find((d) => d.date === selected);
+  const axis = $("axis");
+  axis.innerHTML = "";
+  if (!day) return;
+
+  if (!day.pairs.length) {
+    const title = day.weekday[0].toUpperCase() + day.weekday.slice(1);
+    axis.innerHTML = `<div class="empty"><b>${title}, ${day.day} ${day.month}: пар нет</b>
+      Хороший день, чтобы разобрать конспекты прошлой недели.</div>`;
+    return;
+  }
+
+  for (const pair of day.pairs) {
+    const slot = document.createElement("div");
+    slot.className = "slot " + pair.state;
+    const where = pair.remote ? "дистанционно" : (pair.room ? `очно, ауд. ${pair.room}` : "очно");
+    slot.innerHTML = `
+      <div class="time mono">${pair.start}<i>${pair.end}</i></div>
+      <div class="track">
+        <div class="card">
+          <div class="name">${esc(pair.subject)}</div>
+          <div class="meta">${esc(pair.title)} · ${esc(pair.teacher)}</div>
+          <div class="tags"></div>
+        </div>
+      </div>`;
+    const tags = slot.querySelector(".tags");
+    const place = document.createElement("span");
+    place.className = "tag" + (pair.remote ? "" : " here");
+    place.textContent = where;
+    tags.appendChild(place);
+
+    if (pair.link) {
+      const a = document.createElement("a");
+      a.href = pair.link;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.className = "act join";
+      a.innerHTML = joinIcon + "Войти";
+      tags.appendChild(a);
+    }
+    if (pair.recorded) {
+      const btn = document.createElement("button");
+      btn.className = "act ghost";
+      btn.textContent = "Конспект";
+      btn.onclick = () => openLecture(pair.recorded);
+      tags.appendChild(btn);
+    } else if (pair.state === "now" && !pair.remote) {
+      const go = document.createElement("button");
+      go.className = "act ghost";
+      go.textContent = "Записать с микрофона";
+      go.onclick = () => startRecording();
+      tags.appendChild(go);
+    }
+    axis.appendChild(slot);
+  }
+}
+
+const esc = (text) => String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+/* ---------- запись ---------- */
+
+async function startRecording() {
+  $("dock-action").disabled = true;
+  try {
+    const res = await api("/api/record/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    if (res.error) note(res.error);
+  } catch (e) {
+    note("Агент не отвечает");
+  }
+  $("dock-action").disabled = false;
+  refresh();
+}
+
+async function stopRecording() {
+  $("dock-action").disabled = true;
+  try {
+    await api("/api/record/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  } catch (e) {
+    note("Остановить не получилось");
+  }
+  $("dock-action").disabled = false;
+  refresh();
+  setTimeout(loadLectures, 1500);
+}
+
+const note = (text) => { $("dock-note").textContent = text; };
+
+/* ---------- состояние ---------- */
+
+function drawDock() {
+  const rec = state.recording;
+  const dock = $("dock");
+  dock.classList.remove("hidden");
+  const action = $("dock-action");
+
+  if (rec.active) {
+    $("pulse").classList.remove("hidden");
+    $("timer").classList.remove("hidden");
+    $("level").classList.remove("hidden");
+    $("timer").textContent = hms(rec.seconds);
+    $("dock-title").textContent = rec.subject;
+    note(rec.title);
+    action.textContent = "Остановить";
+    action.className = "act stop";
+    action.onclick = stopRecording;
+    drawLevel(rec.peak);
+    return;
+  }
+
+  $("pulse").classList.add("hidden");
+  $("timer").classList.add("hidden");
+  $("level").classList.add("hidden");
+  $("dock-join").classList.add("hidden");
+  action.className = "act";
+  action.onclick = startRecording;
+  action.textContent = "Записать пару";
+
+  const status = state.status;
+  if (rec.error) {
+    $("dock-title").textContent = "Запись не пошла";
+    note(rec.error);
+    return;
+  }
+  if (status.stage === "transcribe") {
+    $("dock-title").textContent = "Расшифровываю запись";
+    note(`${status.detail || ""} ${status.percent != null ? Math.round(status.percent) + "%" : ""}`.trim());
+  } else if (status.stage === "summary") {
+    $("dock-title").textContent = "Пишу конспект";
+    note("Claude разбирает расшифровку");
+  } else if (state.current) {
+    $("dock-title").textContent = state.current.subject;
+    note(`${state.current.title} · идёт до ${state.current.end}`);
+  } else if (state.next) {
+    const day = state.next.date === state.date ? "сегодня" : "";
+    $("dock-title").textContent = "Сейчас пар нет";
+    note(`Дальше: ${state.next.subject}, ${day} в ${state.next.start}`.replace("  ", " "));
+  } else {
+    $("dock-title").textContent = "Сейчас пар нет";
+    note("Расписание на сегодня закончилось");
+  }
+}
+
+function drawLevel(peak) {
+  const box = $("level");
+  if (box.children.length !== 14) {
+    box.innerHTML = "";
+    for (let i = 0; i < 14; i++) box.appendChild(document.createElement("i"));
+  }
+  const db = 20 * Math.log10(Math.max(peak, 1e-6));
+  const lit = Math.round(Math.max(0, Math.min(1, (db + 60) / 60)) * 14);
+  [...box.children].forEach((bar, i) => {
+    bar.className = i < lit ? "on" : "";
+    bar.style.height = `${40 + i * 4}%`;
+  });
+}
+
+async function refresh() {
+  try {
+    state = await api("/api/state");
+  } catch (e) {
+    $("dock-title").textContent = "Агент остановлен";
+    note("Запусти python agent.py ui и обнови страницу");
+    return;
+  }
+  $("group").textContent = state.group || "Расписание";
+  $("subgroup").textContent = state.subgroup ? `подгруппа ${state.subgroup}` : "";
+  $("clock").innerHTML = `${state.time}<small>Москва</small>`;
+  drawDock();
+}
+
+/* ---------- конспекты ---------- */
+
+async function loadLectures() {
+  const data = await api("/api/lectures");
+  for (const item of data.items) if (item.audio) lectureFiles[item.path] = `${item.path}/${item.audio}`;
+  const box = $("lectures");
+  box.innerHTML = "";
+  if (!data.items.length) {
+    box.innerHTML = `<div class="empty"><b>Записей пока нет</b>
+      Нажми «Записать пару» во время занятия или включи запись вкладки через расширение.</div>`;
+    return;
+  }
+  for (const item of data.items) {
+    const el = document.createElement("button");
+    el.className = "row";
+    const stamp = item.session.slice(0, 10).split("-").reverse().slice(0, 2).join(".");
+    const kind = item.session.slice(11) || "запись";
+    el.innerHTML = `<span class="when mono">${stamp}</span>
+      <span class="grow"><div>${esc(item.subject)}</div>
+      <div class="when">${esc(kind)}</div></span>`;
+    const tag = document.createElement("span");
+    tag.className = "tag" + (item.notes ? " ready" : "");
+    tag.textContent = item.notes ? "конспект" : item.transcript ? "расшифровка" : "звук";
+    el.appendChild(tag);
+    el.onclick = () => openLecture(item.path);
+    box.appendChild(el);
+  }
+}
+
+async function openLecture(path) {
+  lecture = await api(`/api/lecture?path=${encodeURIComponent(path)}`);
+  showRaw = false;
+  show("reader");
+  drawLecture();
+}
+
+function drawLecture() {
+  $("path").textContent = lecture.folder;
+  const body = $("note-body");
+  const text = showRaw ? lecture.transcript : lecture.notes;
+  $("toggle-raw").textContent = showRaw ? "Конспект" : "Расшифровка";
+  $("toggle-raw").disabled = showRaw ? !lecture.notes : !lecture.transcript;
+
+  if (!text) {
+    body.innerHTML = `<div class="empty"><b>Здесь пока пусто</b>
+      Конспект появится, когда агент закончит расшифровку.</div>`;
+  } else if (showRaw) {
+    body.innerHTML = `<div class="raw">${markTimestamps(esc(text))}</div>`;
+  } else {
+    body.innerHTML = markdown(text);
+  }
+
+  const audio = lecture.path && lectureAudio();
+  const player = $("player");
+  if (audio) {
+    player.src = `/api/audio?path=${encodeURIComponent(audio)}`;
+    player.classList.remove("hidden");
+  } else {
+    player.classList.add("hidden");
+  }
+}
+
+let lectureFiles = {};
+function lectureAudio() {
+  return lectureFiles[lecture.path] || null;
+}
+
+const markTimestamps = (text) => text.replace(/\[(\d{2}:\d{2}:\d{2})\]/g, '<span class="stamp">[$1]</span>');
+
+/* компактный разбор Markdown: заголовки, списки, выделение, код, цитаты */
+function markdown(src) {
+  const lines = src.replace(/^---\n[\s\S]*?\n---\n/, "").split("\n");
+  const out = [];
+  let list = null, code = false;
+  const inline = (t) => markTimestamps(esc(t))
+    .replace(/\$\$(.+?)\$\$/gs, '<span class="tex">$1</span>')
+    .replace(/\$([^$\n]+)\$/g, '<span class="tex">$1</span>')
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  const closeList = () => { if (list) { out.push(`</${list}>`); list = null; } };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (line.startsWith("```")) {
+      closeList();
+      out.push(code ? "</pre>" : "<pre>");
+      code = !code;
+      continue;
+    }
+    if (code) { out.push(esc(raw)); continue; }
+    if (!line.trim()) { closeList(); continue; }
+
+    const head = line.match(/^(#{1,4})\s+(.*)$/);
+    if (head) { closeList(); out.push(`<h${head[1].length}>${inline(head[2])}</h${head[1].length}>`); continue; }
+    if (/^(-{3,}|\*{3,})$/.test(line)) { closeList(); out.push("<hr>"); continue; }
+    if (line.startsWith("> ")) { closeList(); out.push(`<blockquote>${inline(line.slice(2))}</blockquote>`); continue; }
+
+    const ordered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (ordered || bullet) {
+      const want = ordered ? "ol" : "ul";
+      if (list !== want) { closeList(); out.push(`<${want}>`); list = want; }
+      out.push(`<li>${inline((ordered || bullet)[1])}</li>`);
+      continue;
+    }
+    closeList();
+    out.push(`<p>${inline(line)}</p>`);
+  }
+  closeList();
+  if (code) out.push("</pre>");
+  return out.join("\n");
+}
+
+/* ---------- переключение экранов ---------- */
+
+function show(view) {
+  $("view-schedule").classList.toggle("hidden", view !== "schedule");
+  $("view-notes").classList.toggle("hidden", view !== "notes");
+  $("view-reader").classList.toggle("hidden", view !== "reader");
+  $("tab-schedule").setAttribute("aria-selected", String(view === "schedule"));
+  $("tab-notes").setAttribute("aria-selected", String(view !== "schedule"));
+  window.scrollTo(0, 0);
+}
+
+$("tab-schedule").onclick = () => { show("schedule"); loadWeek(weekOffset); };
+$("tab-notes").onclick = () => { show("notes"); loadLectures(); };
+$("back").onclick = () => { show("notes"); loadLectures(); };
+$("toggle-raw").onclick = () => { showRaw = !showRaw; drawLecture(); };
+$("prev").onclick = () => loadWeek(weekOffset - 1);
+$("next").onclick = () => loadWeek(weekOffset + 1);
+
+(async () => {
+  await refresh();
+  await loadWeek(0);
+  await loadLectures();
+  setInterval(refresh, 2000);
+  setInterval(() => { if (!$("view-schedule").classList.contains("hidden")) loadWeek(weekOffset); }, 60000);
+})();
+</script>
+</body>
+</html>
