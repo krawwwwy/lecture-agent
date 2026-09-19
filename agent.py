@@ -50,6 +50,7 @@ DEFAULTS: dict = {
         "model": "claude-sonnet-5",
         "gemini_model": "gemini-2.5-flash",
         "openrouter_model": "deepseek/deepseek-v4-flash-0731:free",
+        "openrouter_free_only": True,
         "cli_model": "",
         "effort": "medium",
         "max_tokens": 32000,
@@ -321,6 +322,7 @@ SYSTEM_PROMPT = """\
 
 Убирай воду: приветствия, перекличку, отвлечения, повторы. Но всё, что преподаватель подчёркивал как важное («это будет на экзамене», «запишите», «запомните»), обязательно сохрани и выдели жирным.
 Пиши на том языке, на котором шла пара.
+Не используй длинные тире, ни em dash, ни en dash: только обычный дефис-минус. Вместо тире ставь двоеточие или перестрой фразу, а диапазоны пиши через дефис, например «задачи 1-8».
 """
 
 
@@ -549,6 +551,75 @@ def summarize_gemini(request_text: str, cfg: dict, key: str) -> str:
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+_openrouter_prices: dict[str, float] | None = None
+
+
+def open_with_retry(request, timeout: float, attempts: int = 4):
+    """
+    Соединение иногда не устанавливается с первого раза: рукопожатие TLS
+    отваливается по таймауту, а следующая попытка проходит. Повторяем только
+    обрывы связи. Ответ сервера, даже с ошибкой, это уже результат, его не трогаем.
+    """
+    delay = 2.0
+    for attempt in range(1, attempts + 1):
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            if attempt == attempts:
+                raise RuntimeError(f"связь не установилась за {attempts} попыток: {err}") from None
+            print(f"  связь оборвалась, повтор {attempt + 1} из {attempts}...")
+            time.sleep(delay)
+            delay *= 2
+    return None
+
+
+def openrouter_price(model: str) -> float | None:
+    """
+    Цена модели за токен. None значит, что прайс-лист не удалось получить.
+    Список тянем один раз на запуск: он большой, а меняется редко.
+    """
+    global _openrouter_prices
+    if _openrouter_prices is None:
+        request = urllib.request.Request(OPENROUTER_MODELS_URL,
+                                         headers={"User-Agent": "lecture-agent"})
+        try:
+            with open_with_retry(request, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+        prices = {}
+        for item in data.get("models", []) or data.get("data", []):
+            pricing = item.get("pricing") or {}
+            try:
+                prices[item["id"]] = (float(pricing.get("prompt") or 0)
+                                      + float(pricing.get("completion") or 0))
+            except (KeyError, TypeError, ValueError):
+                continue
+        _openrouter_prices = prices
+    return _openrouter_prices.get(model)
+
+
+def ensure_free_model(model: str) -> None:
+    """
+    Не даём уйти на платную модель. Суффикс «:free» это соглашение OpenRouter,
+    но полагаться только на него нельзя: имя можно поправить в config.yaml
+    и незаметно начать тратить деньги. Поэтому сверяемся с прайс-листом.
+    """
+    price = openrouter_price(model)
+    if price is None:
+        if model.endswith(":free"):
+            return  # прайс-лист недоступен, но имя обещает бесплатность
+        raise RuntimeError(
+            f"Не удалось проверить, бесплатна ли модель «{model}», а в config.yaml "
+            "стоит openrouter_free_only: true.\n"
+            "  Возьми модель с суффиксом :free, список: openrouter.ai/models?max_price=0")
+    if price > 0:
+        raise RuntimeError(
+            f"Модель «{model}» платная, а в config.yaml стоит openrouter_free_only: true.\n"
+            "  Бесплатные перечислены здесь: openrouter.ai/models?max_price=0")
 
 
 def summarize_openrouter(request_text: str, cfg: dict, key: str) -> str:
@@ -559,6 +630,8 @@ def summarize_openrouter(request_text: str, cfg: dict, key: str) -> str:
     """
     s = cfg["summary"]
     model = str(s.get("openrouter_model") or "deepseek/deepseek-v4-flash-0731:free")
+    if s.get("openrouter_free_only", True):
+        ensure_free_model(model)
     body = {
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT},
@@ -578,7 +651,7 @@ def summarize_openrouter(request_text: str, cfg: dict, key: str) -> str:
     written = 0
     finish = ""
     try:
-        with urllib.request.urlopen(http, timeout=900) as resp:
+        with open_with_retry(http, timeout=900) as resp:
             for raw in resp:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):

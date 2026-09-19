@@ -22,6 +22,8 @@ pip install -r requirements.txt
 setx OPENROUTER_API_KEY "sk-or-..."
 ```
 
+Пока в `config.yaml` стоит `openrouter_free_only: true`, агент перед каждым запросом сверяется с прайс-листом OpenRouter и отказывается работать с платной моделью. Так опечатка в названии не превратится в счёт.
+
 **Claude Code, без ключа.** Если на компьютере стоит Claude Code, агент может звать его напрямую: конспект оплачивает подписка, ключ не нужен. Один раз выполни `claude login` в терминале и поставь в `config.yaml` строку `provider: claude_cli`.
 
 **Gemini, бесплатно.** Ключ создаётся на aistudio.google.com («Get API key»). Важно: Gemini API обслуживает не все страны, из закрытого региона он отвечает `User location is not supported` при полностью рабочем ключе.
