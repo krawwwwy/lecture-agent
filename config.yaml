@@ -23,11 +23,28 @@ transcription:
   compute_type: auto
 
 summary:
-  # Ключ к Claude API берётся из переменной окружения ANTHROPIC_API_KEY.
-  # Вписывать его сюда не нужно: этот файл лежит в репозитории.
   enabled: true
-  model: claude-sonnet-5
-  # Сколько Claude "думает": low / medium / high. medium вполне хватает для конспектов
+
+  # Кто пишет конспект:
+  #   auto        по порядку: ключ Claude, ключ OpenRouter, ключ Gemini, claude CLI
+  #   openrouter  много моделей, среди них бесплатные, ключ с openrouter.ai
+  #   claude_cli  через Claude Code, отдельный ключ не нужен, платит подписка
+  #   gemini      Google Gemini, ключ бесплатный, но API доступен не из любой страны
+  #   anthropic   Claude API, ключ платный
+  # Ключи берутся из переменных окружения: OPENROUTER_API_KEY, GEMINI_API_KEY,
+  # ANTHROPIC_API_KEY. Вписывать их сюда не нужно, этот файл лежит в репозитории.
+  provider: auto
+
+  model: claude-sonnet-5          # если provider = anthropic
+  gemini_model: gemini-2.5-flash  # если provider = gemini
+  cli_model: ""                   # если provider = claude_cli, пусто = модель из Claude Code
+
+  # если provider = openrouter. Суффикс :free означает бесплатную модель,
+  # список: openrouter.ai/models?max_price=0
+  openrouter_model: deepseek/deepseek-v4-flash-0731:free
+
+  # Сколько модель "думает" перед ответом: low / medium / high.
+  # medium вполне хватает для конспектов
   effort: medium
   max_tokens: 32000
   # Свои пожелания к конспекту, например: "Пиши короче" или "Добавляй примеры кода на Python"

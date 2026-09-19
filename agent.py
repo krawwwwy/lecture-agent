@@ -30,6 +30,8 @@ import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
@@ -44,7 +46,11 @@ DEFAULTS: dict = {
     "transcription": {"model": "small", "language": "ru", "device": "cpu", "compute_type": "auto"},
     "summary": {
         "enabled": True,
+        "provider": "auto",  # auto / openrouter / claude_cli / gemini / anthropic
         "model": "claude-sonnet-5",
+        "gemini_model": "gemini-2.5-flash",
+        "openrouter_model": "deepseek/deepseek-v4-flash-0731:free",
+        "cli_model": "",
         "effort": "medium",
         "max_tokens": 32000,
         "extra_instructions": "",
@@ -338,6 +344,289 @@ def api_key(cfg: dict) -> str | None:
     return os.environ.get("ANTHROPIC_API_KEY") or cfg["summary"].get("api_key") or None
 
 
+def gemini_key(cfg: dict) -> str | None:
+    return (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            or cfg["summary"].get("gemini_api_key") or None)
+
+
+def openrouter_key(cfg: dict) -> str | None:
+    return os.environ.get("OPENROUTER_API_KEY") or cfg["summary"].get("openrouter_api_key") or None
+
+
+def pick_provider(cfg: dict) -> tuple[str | None, str | None]:
+    """
+    Кто будет писать конспект и каким ключом. Пустой ответ значит, что ключа нет
+    ни одного, и вместо конспекта рядом ляжет prompt_for_claude.md.
+
+    При provider: auto берётся тот, чей ключ задан. Claude идёт первым: если
+    человек завёл платный ключ, он вряд ли хочет, чтобы конспекты втихую делал
+    кто-то другой.
+    """
+    wanted = str(cfg["summary"].get("provider") or "auto").strip().lower()
+    if wanted in ("anthropic", "claude"):
+        return ("anthropic", api_key(cfg)) if api_key(cfg) else (None, None)
+    if wanted in ("gemini", "google"):
+        return ("gemini", gemini_key(cfg)) if gemini_key(cfg) else (None, None)
+    if wanted in ("openrouter", "or"):
+        return ("openrouter", openrouter_key(cfg)) if openrouter_key(cfg) else (None, None)
+    if wanted in ("claude_cli", "cli"):
+        return ("claude_cli", None) if claude_cli_path() else (None, None)
+    if api_key(cfg):
+        return "anthropic", api_key(cfg)
+    if openrouter_key(cfg):
+        return "openrouter", openrouter_key(cfg)
+    if gemini_key(cfg):
+        return "gemini", gemini_key(cfg)
+    if claude_cli_path():  # ключей нет, но рядом стоит Claude Code, хватит и его
+        return "claude_cli", None
+    return None, None
+
+
+def claude_cli_path() -> str | None:
+    import shutil
+
+    return shutil.which("claude")
+
+
+def summarize_claude_cli(request_text: str, cfg: dict) -> str:
+    """
+    Конспект через установленный claude CLI: платит подписка Claude Code,
+    отдельный ключ не нужен, и работает там, где API других провайдеров закрыт.
+
+    Промпт уходит через stdin, а не аргументом: расшифровка пары не влезает
+    в командную строку Windows, там предел около 32 тысяч символов.
+    Рабочей папкой ставим пустую: иначе CLI подхватит CLAUDE.md из проекта
+    и начнёт писать конспект с оглядкой на инструкции для программиста.
+    """
+    import subprocess
+    import tempfile
+
+    exe = claude_cli_path()
+    if not exe:
+        raise RuntimeError("claude CLI не найден. Поставь Claude Code или выбери "
+                           "другой summary.provider в config.yaml.")
+    # Модель по умолчанию не навязываем: CLI возьмёт ту, что выбрана в Claude Code.
+    # Поле cli_model нужно, только если хочется прибить конкретную.
+    model = str(cfg["summary"].get("cli_model") or "").strip()
+    command = [exe, "-p"] + (["--model", model] if model else [])
+
+    print("Пишу конспект (claude CLI, подписка Claude Code)...")
+    set_status("summary", "", None)
+    with tempfile.TemporaryDirectory() as empty:
+        try:
+            done = subprocess.run(
+                command, input=SYSTEM_PROMPT + "\n\n" + request_text,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                cwd=empty, timeout=1800)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("claude CLI не ответил за полчаса.") from None
+        except OSError as err:
+            raise RuntimeError(f"не удалось запустить claude CLI: {err}") from None
+
+    out = (done.stdout or "").strip()
+    if done.returncode != 0 or not out:
+        message = (done.stderr or "").strip() or out or "пустой ответ"
+        if "oauth" in message.lower() or "authenticate" in message.lower():
+            raise RuntimeError("claude CLI не авторизован. Выполни один раз в терминале: "
+                               "claude login") from None
+        raise RuntimeError(f"claude CLI вернул ошибку: {message[:300]}") from None
+    return out
+
+
+GEMINI_HOST = "https://generativelanguage.googleapis.com/v1beta"
+# Сколько модели разрешено думать перед ответом. У Gemini это бюджет в токенах,
+# а не слово, поэтому переводим сами.
+GEMINI_THINKING = {"low": 0, "medium": 8192, "high": 24576}
+
+
+def gemini_models(key: str) -> tuple[list[str], str]:
+    """
+    Какие модели доступны этому ключу, и что помешало, если не доступны ни одной.
+    Нужно, чтобы отличить опечатку в имени модели от недоступности всего сервиса:
+    из закрытого региона любая модель выглядит как несуществующая.
+    """
+    request = urllib.request.Request(f"{GEMINI_HOST}/models", headers={"x-goog-api-key": key})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        try:
+            return [], json.loads(err.read().decode("utf-8", "replace"))["error"]["message"]
+        except Exception:
+            return [], f"список моделей недоступен ({err.code})"
+    except Exception as err:
+        return [], str(err)
+    names = []
+    for item in data.get("models", []):
+        if "generateContent" in (item.get("supportedGenerationMethods") or []):
+            names.append(str(item.get("name", "")).removeprefix("models/"))
+    return names, ""
+
+
+def summarize_gemini(request_text: str, cfg: dict, key: str) -> str:
+    """
+    Конспект через Gemini. Ходим обычным HTTP, без их библиотеки: одна функция
+    не стоит ещё одной зависимости, которую придётся ставить на каждой машине.
+    Ответ читаем потоком, чтобы было видно, что процесс идёт.
+    """
+    s = cfg["summary"]
+    model = str(s.get("gemini_model") or "gemini-2.5-flash")
+    body = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": request_text}]}],
+        "generationConfig": {"maxOutputTokens": int(s["max_tokens"])},
+    }
+    budget = GEMINI_THINKING.get(str(s.get("effort") or "").lower())
+    if budget is not None:
+        body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": budget}
+
+    url = f"{GEMINI_HOST}/models/{model}:streamGenerateContent?alt=sse"
+    http = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"})
+
+    print(f"Пишу конспект ({model})...")
+    set_status("summary", "", None)
+    chunks: list[str] = []
+    written = 0
+    finish = ""
+    try:
+        with urllib.request.urlopen(http, timeout=600) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(payload)
+                except ValueError:
+                    continue
+                for candidate in event.get("candidates", []):
+                    finish = candidate.get("finishReason") or finish
+                    for part in (candidate.get("content") or {}).get("parts", []):
+                        text = part.get("text")
+                        if not text or part.get("thought"):
+                            continue  # размышления модели в конспект не идут
+                        chunks.append(text)
+                        written += len(text)
+                        print(f"\r  написано символов: {written}", end="", flush=True)
+    except urllib.error.HTTPError as err:
+        # Разбираем по сути ошибки, а не по коду: на неверный ключ Gemini
+        # отвечает 400, хотя по смыслу это 401.
+        raw = err.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(raw)["error"]["message"]
+        except Exception:
+            detail = raw[:300]
+        low = detail.lower()
+        if "location is not supported" in low:
+            raise RuntimeError("Gemini не работает в этом регионе: ключ действителен, "
+                               "но Google не обслуживает запросы отсюда.\n"
+                               "  Поставь summary.provider: claude_cli в config.yaml.") from None
+        if "api key not valid" in low or "api_key_invalid" in low or err.code in (401, 403):
+            raise RuntimeError("Gemini не принял ключ. Проверь, что GEMINI_API_KEY "
+                               "скопирован целиком и без пробелов.") from None
+        if err.code == 404 or "not found" in low:
+            available, why = gemini_models(key)
+            if "location is not supported" in why.lower():
+                raise RuntimeError("Gemini не работает в этом регионе: ключ действителен, "
+                                   "но Google не обслуживает запросы отсюда.\n"
+                                   "  Поставь summary.provider: claude_cli в config.yaml.") from None
+            hint = ("\n  Доступные модели: " + ", ".join(available[:8])) if available else ""
+            raise RuntimeError(f"Gemini не знает модель «{model}».{hint}\n"
+                               "  Поправь summary.gemini_model в config.yaml.") from None
+        if err.code == 429 or "quota" in low or "rate limit" in low:
+            raise RuntimeError("Gemini: упёрлись в бесплатный лимит запросов. "
+                               "Попробуй позже или поставь модель полегче.") from None
+        raise RuntimeError(f"Gemini ответил {err.code}: {detail}") from None
+    print()
+    if finish == "MAX_TOKENS":
+        print("  Внимание: ответ упёрся в лимит, конспект может быть обрезан. "
+              "Увеличь summary.max_tokens в config.yaml.")
+    return "".join(chunks)
+
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def summarize_openrouter(request_text: str, cfg: dict, key: str) -> str:
+    """
+    Конспект через OpenRouter. Там есть модели с нулевой ценой, а сам сервис
+    отвечает оттуда, где Gemini и Groq уже закрыты по региону.
+    Формат запросов совместим с OpenAI, ответ читаем потоком.
+    """
+    s = cfg["summary"]
+    model = str(s.get("openrouter_model") or "deepseek/deepseek-v4-flash-0731:free")
+    body = {
+        "model": model,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                     {"role": "user", "content": request_text}],
+        "max_tokens": int(s["max_tokens"]),
+        "stream": True,
+    }
+    http = urllib.request.Request(
+        OPENROUTER_URL, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                 # OpenRouter просит представляться, чтобы считать статистику
+                 "X-Title": "lecture-agent"})
+
+    print(f"Пишу конспект ({model})...")
+    set_status("summary", "", None)
+    chunks: list[str] = []
+    written = 0
+    finish = ""
+    try:
+        with urllib.request.urlopen(http, timeout=900) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(payload)
+                except ValueError:
+                    continue
+                for choice in event.get("choices", []):
+                    finish = choice.get("finish_reason") or finish
+                    text = (choice.get("delta") or {}).get("content")
+                    if not text:
+                        continue
+                    chunks.append(text)
+                    written += len(text)
+                    print(f"\r  написано символов: {written}", end="", flush=True)
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(raw)["error"]["message"]
+        except Exception:
+            detail = raw[:300]
+        low = detail.lower()
+        if err.code == 401 or "no auth" in low or "invalid" in low and "key" in low:
+            raise RuntimeError("OpenRouter не принял ключ. Проверь OPENROUTER_API_KEY, "
+                               "он начинается на sk-or-.") from None
+        if err.code == 402 or "credit" in low:
+            raise RuntimeError("OpenRouter: на бесплатной модели кончилась дневная квота. "
+                               "Попробуй позже или поставь другую модель с «:free».") from None
+        if err.code == 404:
+            raise RuntimeError(f"OpenRouter не знает модель «{model}». Список бесплатных: "
+                               "openrouter.ai/models?max_price=0") from None
+        if err.code == 429:
+            raise RuntimeError("OpenRouter: слишком часто. Подожди минуту.") from None
+        raise RuntimeError(f"OpenRouter ответил {err.code}: {detail}") from None
+    print()
+    if finish == "length":
+        print("  Внимание: ответ упёрся в лимит, конспект может быть обрезан. "
+              "Увеличь summary.max_tokens в config.yaml.")
+    if not chunks:
+        raise RuntimeError("OpenRouter вернул пустой ответ. Обычно это перегруженная "
+                           "бесплатная модель, попробуй ещё раз или смени её.")
+    return "".join(chunks)
+
+
 def summarize(request: str, cfg: dict) -> str:
     import anthropic
 
@@ -386,13 +675,21 @@ def process_session(source: Path, subject: str, when: datetime, cfg: dict,
 
     request = build_request(transcript, subject, when, cfg, meta)
     notes = None
-    if api_key(cfg):
+    provider, key = pick_provider(cfg)
+    makers = {
+        "openrouter": lambda: summarize_openrouter(request, cfg, key),
+        "gemini": lambda: summarize_gemini(request, cfg, key),
+        "anthropic": lambda: summarize(request, cfg),
+        "claude_cli": lambda: summarize_claude_cli(request, cfg),
+    }
+    if provider in makers:
         try:
-            notes = summarize(request, cfg)
+            notes = makers[provider]()
         except Exception as e:
-            print(f"\nНе получилось сделать конспект через API: {e}")
+            print(f"\nНе получилось сделать конспект ({provider}): {e}")
     else:
-        print("Ключ ANTHROPIC_API_KEY не задан, поэтому шаг с конспектом через API пропущен.")
+        print("Некому сделать конспект: нет ни ключа (GEMINI_API_KEY или "
+              "ANTHROPIC_API_KEY), ни установленного claude CLI.")
 
     if not notes:
         fallback = folder / "prompt_for_claude.md"
