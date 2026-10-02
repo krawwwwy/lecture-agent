@@ -123,6 +123,160 @@ def new_session_dir(cfg: dict, subject: str, when: datetime, label: str = "") ->
     return folder
 
 
+# ---------------------------------------------------------------- части одной пары
+#
+# На бесплатном аккаунте Zoom встреча обрывается через 30 минут, преподаватель
+# создаёт её заново, и одна пара превращается в несколько записей. Раньше каждая
+# получала свою папку с суффиксом _2, _3 и свой отдельный конспект. Теперь куски
+# одной пары складываются в одну папку и склеиваются в одну расшифровку,
+# из которой делается один конспект.
+
+PARTS_FILE = "parts.json"
+# Запись короче минуты это ложный старт (нажали и сразу остановили), а не кусок
+# пары. Порог взят с запасом: настоящие обрывки идут от нескольких минут.
+FALSE_START_SECONDS = 60
+STAMP_RE = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})\]")
+
+
+def load_parts(folder: Path) -> dict:
+    """Что известно про куски занятия."""
+    try:
+        data = json.loads((folder / PARTS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"pair_end": None, "parts": []}
+    data.setdefault("parts", [])
+    data.setdefault("pair_end", None)
+    return data
+
+
+def save_parts(folder: Path, data: dict) -> None:
+    (folder / PARTS_FILE).write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                                     encoding="utf-8")
+
+
+def register_part(folder: Path, audio: Path, started: datetime,
+                  pair_end: datetime | None = None) -> int:
+    """Запоминает кусок и возвращает его номер, считая с единицы."""
+    data = load_parts(folder)
+    if pair_end is not None and not data["pair_end"]:
+        data["pair_end"] = pair_end.replace(tzinfo=None).isoformat()
+    for n, part in enumerate(data["parts"], 1):
+        if part["audio"] == audio.name:
+            return n
+    data["parts"].append({"audio": audio.name,
+                          "started": started.replace(tzinfo=None).isoformat(),
+                          "seconds": None})
+    save_parts(folder, data)
+    return len(data["parts"])
+
+
+def set_part_seconds(folder: Path, part: int, seconds: float) -> None:
+    data = load_parts(folder)
+    if 1 <= part <= len(data["parts"]):
+        data["parts"][part - 1]["seconds"] = round(float(seconds), 1)
+        save_parts(folder, data)
+
+
+def drop_part(folder: Path, part: int) -> None:
+    """
+    Убирает ложный старт вместе с файлом. Куски заканчиваются по очереди,
+    поэтому ложный старт это всегда последний зарегистрированный кусок:
+    убрав его, мы не сдвигаем нумерацию остальных. Если вдруг не последний,
+    оставляем запись на месте и только чистим файл, чтобы не сломать отсчёт.
+    """
+    data = load_parts(folder)
+    if not (1 <= part <= len(data["parts"])):
+        return
+    audio = folder / data["parts"][part - 1]["audio"]
+    audio.unlink(missing_ok=True)
+    if part == len(data["parts"]):
+        data["parts"].pop()
+    else:
+        data["parts"][part - 1]["seconds"] = 0
+    save_parts(folder, data)
+    if not data["parts"]:
+        (folder / PARTS_FILE).unlink(missing_ok=True)
+        if not any(folder.iterdir()):
+            folder.rmdir()  # пустую папку от ложного старта не оставляем
+
+
+def next_audio_name(folder: Path, suffix: str) -> Path:
+    """audio.webm для первого куска, дальше audio2.webm, audio3.webm."""
+    first = folder / f"audio{suffix}"
+    if not first.exists():
+        return first
+    n = 2
+    while (folder / f"audio{n}{suffix}").exists():
+        n += 1
+    return folder / f"audio{n}{suffix}"
+
+
+def pair_session_dir(cfg: dict, subject: str, when: datetime, label: str) -> Path:
+    """
+    Папка занятия. Для пары из расписания она всегда одна и та же, даже если
+    запись прерывалась: следующий кусок ляжет рядом с предыдущим, а не в папку
+    с суффиксом _2. Для записи вне расписания всё как было.
+    """
+    if not label:
+        return new_session_dir(cfg, subject, when, label)
+    name = f"{when:%Y-%m-%d} {label}".strip()
+    folder = cfg["output_dir"] / safe_name(subject) / safe_name(name)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def shift_stamps(text: str, offset: float) -> str:
+    """Сдвигает метки времени, чтобы у склеенной расшифровки они шли насквозь."""
+    if offset <= 0:
+        return text
+
+    def move(m: re.Match) -> str:
+        total = int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3]) + int(offset)
+        return f"[{total // 3600:02d}:{total // 60 % 60:02d}:{total % 60:02d}]"
+
+    return STAMP_RE.sub(move, text)
+
+
+def part_text(folder: Path, n: int) -> str:
+    file = folder / f"part-{n}.txt"
+    return file.read_text(encoding="utf-8").strip() if file.exists() else ""
+
+
+def merge_parts(folder: Path) -> str:
+    """
+    Склеивает расшифровки кусков в одну. Метки сдвигаются по реальному времени
+    начала каждого куска, поэтому минута, пока пересоздавали встречу, видна
+    в нумерации, а не пропадает молча. Про сам перерыв ставится пометка,
+    иначе в конспекте появился бы разрыв мысли без объяснения.
+    """
+    parts = load_parts(folder)["parts"]
+    if not parts:
+        return ""
+    first = datetime.fromisoformat(parts[0]["started"])
+    pieces = []
+    for n, part in enumerate(parts, 1):
+        text = part_text(folder, n)
+        if not text:
+            continue
+        started = datetime.fromisoformat(part["started"])
+        if pieces:
+            pieces.append(f"[запись прерывалась, часть {n} началась в {started:%H:%M}]")
+        pieces.append(shift_stamps(text, max(0.0, (started - first).total_seconds())))
+    return "\n\n".join(pieces)
+
+
+def waiting_for_parts(folder: Path, tz) -> bool:
+    """
+    Стоит ли ждать продолжения. Пока пара по расписанию не кончилась, конспект
+    делать рано: следующий кусок всё равно заставит переписывать его заново,
+    а это лишний запрос к модели на каждый обрыв связи.
+    """
+    end = load_parts(folder)["pair_end"]
+    if not end:
+        return False  # занятие вне расписания, продолжения не будет
+    return datetime.now(tz).replace(tzinfo=None) < datetime.fromisoformat(end)
+
+
 # ---------------------------------------------------------------- состояние для интерфейса
 
 STATUS = {"stage": "idle", "detail": "", "percent": None}
@@ -730,12 +884,22 @@ def summarize(request: str, cfg: dict) -> str:
 
 
 def process_session(source: Path, subject: str, when: datetime, cfg: dict,
-                    folder: Path, make_notes: bool = True, meta: dict | None = None) -> None:
-    """Расшифровка (если на входе аудио) и конспект. Результаты сохраняются в folder."""
+                    folder: Path, make_notes: bool = True, meta: dict | None = None,
+                    part: int = 0, tz=None) -> None:
+    """
+    Расшифровка (если на входе аудио) и конспект. Результаты сохраняются в folder.
+    part больше нуля значит, что это кусок пары, которую пришлось писать в несколько
+    заходов: расшифровка кладётся отдельно и склеивается с соседями.
+    """
     if source.suffix.lower() == ".txt":
         transcript = source.read_text(encoding="utf-8")
     else:
-        transcript = transcribe(source, subject, cfg)
+        text = transcribe(source, subject, cfg)
+        if part:
+            (folder / f"part-{part}.txt").write_text(text, encoding="utf-8")
+            transcript = merge_parts(folder)
+        else:
+            transcript = text
         (folder / "transcript.txt").write_text(transcript, encoding="utf-8")
         print(f"Расшифровка сохранена: {folder / 'transcript.txt'}")
 
@@ -744,6 +908,9 @@ def process_session(source: Path, subject: str, when: datetime, cfg: dict,
         print("Речь в записи не найдена. Проверь микрофон: python agent.py devices")
         return
     if not (make_notes and cfg["summary"]["enabled"]):
+        return
+    if part and waiting_for_parts(folder, tz or timezone.utc):
+        print("Пара ещё идёт. Конспект будет, когда придут остальные части.")
         return
 
     request = build_request(transcript, subject, when, cfg, meta)
@@ -893,6 +1060,12 @@ def load_schedule(cfg: dict) -> tuple[dict, list[dict]]:
             "dates": dates,
             "remote": bool(item.get("remote", True)),
             "link": str(item.get("link", "")).strip(),
+            # Код нужен, когда ссылка сама его не подставляет и Zoom спрашивает
+            # его при входе. Запасная ссылка на случай, если преподаватель уехал
+            # и ведёт пару с другой площадки.
+            "passcode": str(item.get("passcode", "")).strip(),
+            "backup_link": str(item.get("backup_link", "")).strip(),
+            "backup_passcode": str(item.get("backup_passcode", "")).strip(),
         })
 
     # сквозная нумерация: «Лекция 5 из 12» по каждому предмету и виду занятия
@@ -1196,6 +1369,7 @@ def run_server(cfg: dict, open_browser: bool = False) -> None:
 
             auto = params.get("auto", ["0"])[0] == "1"
             info = current_pair(when) if auto else None
+            started = when  # когда началась именно эта запись, а не пара целиком
             if info:
                 subject, label = info["subject"], info["label"]
                 when = info["start"]
@@ -1204,8 +1378,16 @@ def run_server(cfg: dict, open_browser: bool = False) -> None:
                 subject = (params.get("subject", [""])[0] or cfg["server"]["default_subject"]).strip()
                 label, note = "", "вне расписания"
 
-            folder = new_session_dir(cfg, subject, when.replace(tzinfo=None), label)
-            s = {"folder": folder, "path": folder / "audio.webm", "subject": subject,
+            folder = pair_session_dir(cfg, subject, when.replace(tzinfo=None), label)
+            audio = next_audio_name(folder, ".webm") if label else folder / "audio.webm"
+            # Кусками считаем только пары из расписания: там понятно, где пара
+            # кончается и какие записи относятся к одной и той же.
+            part = register_part(folder, audio, started,
+                                 info["end"] if info else None) if label else 0
+            if part > 1:
+                note += f", часть {part}, встречу пересоздали"
+            s = {"folder": folder, "path": audio, "subject": subject, "part": part,
+                 "started": started.replace(tzinfo=None),
                  "when": when.replace(tzinfo=None), "bytes": 0, "lock": threading.Lock(),
                  "meta": {"kind": info["kind"], "teacher": info["teacher"], "room": info["room"],
                           "title": info["title"], "format": info["format"]} if info else None}
@@ -1231,8 +1413,11 @@ def run_server(cfg: dict, open_browser: bool = False) -> None:
             subject = (subject_override or cfg["server"]["default_subject"]).strip()
             label, when, title, job_meta = "", now, "вне расписания", None
 
-        folder = new_session_dir(cfg, subject, when.replace(tzinfo=None), label)
-        audio = folder / "audio.flac"
+        folder = pair_session_dir(cfg, subject, when.replace(tzinfo=None), label)
+        audio = next_audio_name(folder, ".flac") if label else folder / "audio.flac"
+        part = register_part(folder, audio, now, info["end"] if info else None) if label else 0
+        if part > 1:
+            title += f", часть {part}"
         stop = threading.Event()
 
         def tick(seconds, peak):
@@ -1242,9 +1427,15 @@ def run_server(cfg: dict, open_browser: bool = False) -> None:
             try:
                 seconds, _ = record_audio(audio, cfg, live=False, stop_event=stop, on_tick=tick)
                 print(f"[{datetime.now(tz):%H:%M}] Запись «{subject}» закончена ({fmt_ts(seconds)}).")
-                if seconds >= 3:
+                if part and seconds < FALSE_START_SECONDS:
+                    print("  Слишком коротко для куска пары, считаю это ложным стартом.")
+                    drop_part(folder, part)
+                elif seconds >= 3:
+                    if part:
+                        set_part_seconds(folder, part, seconds)
                     jobs.put({"source": audio, "subject": subject, "when": when.replace(tzinfo=None),
-                              "cfg": cfg, "folder": folder, "meta": job_meta})
+                              "cfg": cfg, "folder": folder, "meta": job_meta,
+                              "part": part, "tz": tz})
             except Exception as e:
                 message = str(e)
                 if "PortAudio" in message:
@@ -1254,8 +1445,10 @@ def run_server(cfg: dict, open_browser: bool = False) -> None:
                 set_status("idle")
             finally:
                 mic.update({"active": False, "stop": None, "thread": None})
-                if not audio.exists() and not any(folder.iterdir()):
-                    folder.rmdir()  # пустую папку от неудачной записи не оставляем
+                # пустую папку от неудачной записи не оставляем, но её мог уже
+                # убрать drop_part, поэтому проверяем, что она вообще на месте
+                if folder.exists() and not audio.exists() and not any(folder.iterdir()):
+                    folder.rmdir()
 
         thread = threading.Thread(target=worker, daemon=True)
         mic.update({"active": True, "subject": subject, "title": title, "seconds": 0.0,
@@ -1294,15 +1487,19 @@ def run_server(cfg: dict, open_browser: bool = False) -> None:
             for session in sorted(subject_dir.iterdir(), reverse=True):
                 if not session.is_dir():
                     continue
-                audio = next((f.name for f in session.iterdir()
-                              if f.suffix in (".flac", ".webm", ".m4a", ".mp3", ".wav")), "")
+                # Пару могли писать в несколько заходов, тогда звука несколько файлов.
+                # Порядок по номеру куска, а не по алфавиту: audio2 идёт после audio.
+                audios = sorted((f.name for f in session.iterdir()
+                                 if f.suffix in (".flac", ".webm", ".m4a", ".mp3", ".wav")),
+                                key=audio_order)
                 items.append({
                     "path": f"{subject_dir.name}/{session.name}",
                     "subject": subject_dir.name,
                     "session": session.name,
                     "notes": (session / "notes.md").exists(),
                     "transcript": (session / "transcript.txt").exists(),
-                    "audio": audio,
+                    "audio": audios[0] if audios else "",
+                    "parts": audios,
                     "time": session.stat().st_mtime,
                 })
         items.sort(key=lambda x: x["time"], reverse=True)
@@ -1331,6 +1528,9 @@ def run_server(cfg: dict, open_browser: bool = False) -> None:
                     "state": ("now" if start <= moment <= end else
                               "past" if moment > end else "future"),
                     "link": pair["link"],
+                    "passcode": pair["passcode"],
+                    "backup_link": pair["backup_link"],
+                    "backup_passcode": pair["backup_passcode"],
                     "recorded": match,
                 })
             days.append({"date": day.isoformat(), "weekday": DAY_FULL[day.weekday()],
@@ -1518,16 +1718,26 @@ def run_server(cfg: dict, open_browser: bool = False) -> None:
                     self.reply(404, {"error": "unknown session"})
                     return
                 size_mb = s["bytes"] / 1024 / 1024
-                if s["bytes"] < 20_000:
+                seconds = (datetime.now(meta["tz"] if meta else timezone.utc).replace(tzinfo=None)
+                           - s["started"]).total_seconds()
+                # Ложный старт: нажали запись и почти сразу остановили. Такой кусок
+                # нельзя склеивать с парой, иначе он собьёт отсчёт времени.
+                too_short = s["bytes"] < 20_000 or (s["part"] and seconds < FALSE_START_SECONDS)
+                if too_short:
                     print(f"[{datetime.now():%H:%M}] Запись «{s['subject']}» пустая "
                           "или совсем короткая, обрабатывать нечего. "
                           "Проверь, что во вкладке был звук.")
+                    if s["part"]:
+                        drop_part(s["folder"], s["part"])
                     self.reply(200, {"ok": True, "queued": False})
                     return
+                if s["part"]:
+                    set_part_seconds(s["folder"], s["part"], seconds)
                 print(f"[{datetime.now():%H:%M}] Запись «{s['subject']}» получена "
                       f"({size_mb:.1f} МБ), обрабатываю.")
                 jobs.put({"source": s["path"], "subject": s["subject"], "when": s["when"],
-                          "cfg": cfg, "folder": s["folder"], "meta": s["meta"]})
+                          "cfg": cfg, "folder": s["folder"], "meta": s["meta"],
+                          "part": s["part"], "tz": meta["tz"] if meta else timezone.utc})
                 self.reply(200, {"ok": True, "queued": True, "folder": str(s["folder"])})
             else:
                 self.reply(404, {"error": "unknown endpoint"})
@@ -1617,6 +1827,228 @@ def cmd_record(args, cfg: dict) -> None:
     process_session(audio, subject, when, cfg, folder, make_notes=not args.no_notes, meta=info)
 
 
+def part_duration(folder: Path, audio: Path | None) -> float:
+    """
+    Сколько длилась запись. Точнее всего это видно по последней метке времени
+    в расшифровке. Если расшифровки нет, берём разницу между созданием файла
+    и последней записью в него: звук дописывается по ходу пары, так что она
+    примерно равна длине записи.
+    """
+    stamps = STAMP_RE.findall((folder / "transcript.txt").read_text(encoding="utf-8", errors="replace")) \
+        if (folder / "transcript.txt").exists() else []
+    if stamps:
+        h, m, s = stamps[-1]
+        return int(h) * 3600 + int(m) * 60 + int(s)
+    if audio and audio.exists():
+        st = audio.stat()
+        return max(0.0, st.st_mtime - st.st_ctime)
+    return 0.0
+
+
+def audio_order(name: str) -> int:
+    """audio.webm это первый кусок, audio2.webm второй. Чужие имена в конец."""
+    m = re.match(r"audio(\d*)\.", name)
+    if not m:
+        return 99
+    return int(m[1]) if m[1] else 1
+
+
+def find_audio(folder: Path) -> Path | None:
+    files = [f for f in sorted(folder.iterdir())
+             if f.suffix.lower() in (".flac", ".webm", ".m4a", ".mp3", ".wav", ".ogg")]
+    return files[0] if files else None
+
+
+def find_part_groups(cfg: dict) -> list[dict]:
+    """
+    Занятия, которые раньше разъехались по папкам с суффиксами _2 и _3.
+    Суффикс ставил new_session_dir, когда папка занятия уже была занята,
+    то есть ровно тогда, когда пару писали в несколько заходов.
+    """
+    root = cfg["output_dir"]
+    groups = []
+    if not root.exists():
+        return groups
+    for subject_dir in sorted(root.iterdir()):
+        if not subject_dir.is_dir():
+            continue
+        bases: dict[str, list[Path]] = {}
+        for session in sorted(subject_dir.iterdir()):
+            if session.is_dir():
+                bases.setdefault(re.sub(r"_\d+$", "", session.name), []).append(session)
+        for base, folders in bases.items():
+            if len(folders) > 1:
+                groups.append({"subject": subject_dir.name, "base": base, "dir": subject_dir,
+                               "folders": sorted(folders, key=lambda p: p.stat().st_ctime)})
+    return groups
+
+
+def plan_merge(group: dict) -> list[dict]:
+    """Что делать с каждой папкой: стать куском пары или отправиться в мусор."""
+    entries = []
+    for folder in group["folders"]:
+        audio = find_audio(folder)
+        seconds = part_duration(folder, audio)
+        transcript = folder / "transcript.txt"
+        entries.append({
+            "folder": folder, "audio": audio, "seconds": seconds,
+            "text": transcript.read_text(encoding="utf-8") if transcript.exists() else "",
+            "started": datetime.fromtimestamp(folder.stat().st_ctime),
+            "keep": bool(audio) and seconds >= FALSE_START_SECONDS,
+        })
+    entries.sort(key=lambda e: e["started"])
+    return entries
+
+
+def apply_merge(group: dict, entries: list[dict], cfg: dict, make_notes: bool) -> None:
+    target = group["dir"] / group["base"]
+    target.mkdir(parents=True, exist_ok=True)
+    kept = [e for e in entries if e["keep"]]
+
+    # Сначала уводим звук во временные имена: иначе кусок, который должен стать
+    # первым, может налететь на файл, который первым быть перестал.
+    for n, entry in enumerate(kept, 1):
+        staged = target / f".merge-{n}{entry['audio'].suffix}"
+        entry["audio"].replace(staged)
+        entry["staged"] = staged
+
+    for old in ("transcript.txt", "notes.md", "prompt_for_claude.md", PARTS_FILE):
+        (target / old).unlink(missing_ok=True)
+    for stale in target.glob("part-*.txt"):
+        stale.unlink()
+
+    parts = []
+    for n, entry in enumerate(kept, 1):
+        suffix = entry["staged"].suffix
+        final = target / (f"audio{suffix}" if n == 1 else f"audio{n}{suffix}")
+        entry["staged"].replace(final)
+        if entry["text"].strip():
+            (target / f"part-{n}.txt").write_text(entry["text"], encoding="utf-8")
+        parts.append({"audio": final.name, "started": entry["started"].isoformat(),
+                      "seconds": round(entry["seconds"], 1)})
+        entry["final"] = final
+    save_parts(target, {"pair_end": None, "parts": parts})
+
+    # Ложные старты убираем вместе с их файлами. Отдельно про тот случай, когда
+    # ложный старт лежит в самой целевой папке: папку сносить нельзя, а звук от
+    # него остаться не должен, иначе он попадёт в проигрыватель как лишняя часть.
+    for entry in entries:
+        if entry["keep"]:
+            continue
+        folder = entry["folder"]
+        if folder == target:
+            if entry["audio"]:
+                entry["audio"].unlink(missing_ok=True)
+            continue
+        if not folder.exists():
+            continue
+        for leftover in folder.iterdir():
+            leftover.unlink()
+        folder.rmdir()
+    for entry in entries:
+        folder = entry["folder"]
+        if entry["keep"] and folder != target and folder.exists():
+            for leftover in folder.iterdir():
+                leftover.unlink()
+            folder.rmdir()
+
+    # Кусок без расшифровки надо сначала расшифровать, иначе он выпадет из склейки
+    for n, entry in enumerate(kept, 1):
+        if (target / f"part-{n}.txt").exists():
+            continue
+        print(f"  Часть {n} не расшифрована, расшифровываю ({entry['final'].name})...")
+        text = transcribe(entry["final"], group["subject"], cfg)
+        (target / f"part-{n}.txt").write_text(text, encoding="utf-8")
+
+    merged = merge_parts(target)
+    (target / "transcript.txt").write_text(merged, encoding="utf-8")
+    print(f"  Склеено частей: {len(kept)}, в расшифровке символов: {len(merged)}.")
+
+    if make_notes and merged.strip():
+        when = kept[0]["started"] if kept else datetime.now()
+        process_session(target / "transcript.txt", group["subject"], when, cfg, target,
+                        make_notes=True, meta={"title": group["base"]})
+
+
+def cmd_merge(args, cfg: dict) -> None:
+    """Склеивает занятия, которые записались несколькими кусками."""
+    groups = find_part_groups(cfg)
+    if not groups:
+        print("Занятий, разложенных по нескольким папкам, не нашлось.")
+        return
+
+    print(f"Нашлось занятий, записанных в несколько заходов: {len(groups)}\n")
+    plans = []
+    for group in groups:
+        entries = plan_merge(group)
+        plans.append((group, entries))
+        print(f"{group['subject']} / {group['base']}")
+        n = 0
+        for entry in entries:
+            if entry["keep"]:
+                n += 1
+                verdict = f"часть {n}"
+            else:
+                verdict = "ложный старт, в мусор"
+            print(f"  {entry['folder'].name:26} {entry['started']:%d.%m %H:%M}  "
+                  f"{fmt_ts(entry['seconds']):>8}  {verdict}")
+        print()
+
+    if not args.apply:
+        print("Это показ без изменений. Чтобы склеить, добавь --apply.")
+        return
+
+    for group, entries in plans:
+        print(f"Склеиваю {group['subject']} / {group['base']}")
+        apply_merge(group, entries, cfg, make_notes=not args.no_notes)
+    print("\nГотово.")
+
+
+def cmd_notes(args, cfg: dict) -> None:
+    """
+    Доделывает конспекты там, где есть расшифровка, но конспекта нет.
+    Так добираются занятия, записанные до того, как появился ключ, и те,
+    что только что склеили из кусков.
+    """
+    root = cfg["output_dir"]
+    todo = []
+    for subject_dir in sorted(root.iterdir()) if root.exists() else []:
+        if not subject_dir.is_dir():
+            continue
+        for session in sorted(subject_dir.iterdir()):
+            transcript = session / "transcript.txt"
+            if not session.is_dir() or not transcript.exists():
+                continue
+            if (session / "notes.md").exists() and not args.all:
+                continue
+            if not transcript.read_text(encoding="utf-8", errors="replace").strip():
+                continue
+            todo.append((subject_dir.name, session, transcript))
+
+    if not todo:
+        print("Занятий без конспекта не нашлось.")
+        return
+    print(f"Занятий без конспекта: {len(todo)}\n")
+    for subject, session, transcript in todo:
+        print(f"  {subject} / {session.name}  ({transcript.stat().st_size // 1024} КБ расшифровки)")
+    if not args.apply:
+        print("\nЭто показ без изменений. Чтобы сделать конспекты, добавь --apply.")
+        return
+
+    for subject, session, transcript in todo:
+        print(f"\n=== {subject} / {session.name} ===")
+        try:
+            when = datetime.strptime(session.name[:10], "%Y-%m-%d")
+        except ValueError:
+            when = datetime.fromtimestamp(session.stat().st_ctime)
+        try:
+            process_session(transcript, subject, when, cfg, session,
+                            make_notes=True, meta={"title": session.name[11:] or session.name})
+        except Exception as e:
+            print(f"  не получилось: {e}")
+    print("\nГотово.")
+
+
 def cmd_process(args, cfg: dict) -> None:
     source = Path(args.file).expanduser().resolve()
     if not source.exists():
@@ -1652,6 +2084,14 @@ def main() -> None:
     tt.add_argument("-d", "--date", help="конкретный день, например 2026-10-14")
     tt.add_argument("-s", "--subject", help="все занятия по предмету")
 
+    mrg = sub.add_parser("merge", help="склеить пару, записанную несколькими кусками")
+    mrg.add_argument("--apply", action="store_true", help="не показать, а правда склеить")
+    mrg.add_argument("--no-notes", action="store_true", help="склеить, но конспект не переписывать")
+
+    nts = sub.add_parser("notes", help="доделать конспекты там, где есть только расшифровка")
+    nts.add_argument("--apply", action="store_true", help="не показать, а правда сделать")
+    nts.add_argument("--all", action="store_true", help="переписать и уже готовые конспекты")
+
     sub.add_parser("schedule", help="самому записывать очные пары по расписанию")
     sub.add_parser("ui", help="открыть приложение в браузере (расписание, запись, конспекты)")
     sub.add_parser("serve", help="то же самое, но без открытия браузера")
@@ -1668,6 +2108,10 @@ def main() -> None:
         cmd_process(args, cfg)
     elif args.command == "timetable":
         cmd_timetable(args, cfg)
+    elif args.command == "merge":
+        cmd_merge(args, cfg)
+    elif args.command == "notes":
+        cmd_notes(args, cfg)
     elif args.command == "schedule":
         run_schedule(cfg)
     elif args.command in ("serve", "ui"):

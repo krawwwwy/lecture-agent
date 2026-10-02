@@ -106,16 +106,18 @@ nav button:focus-visible { outline: 2px solid var(--steel); outline-offset: 3px;
 .tag.here { color: var(--steel); border-color: color-mix(in srgb, var(--steel) 45%, var(--rule)); }
 .tag.ready { color: var(--done); border-color: color-mix(in srgb, var(--done) 45%, var(--rule)); }
 
-button.act {
+/* a.act рядом с button.act: «Войти» и «Запасная ссылка» это ссылки, а не кнопки,
+   и без a.act они рисовались бы обычным подчёркнутым текстом. */
+button.act, a.act {
   font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 99px; cursor: pointer;
-  border: 1px solid var(--steel); background: var(--steel); color: #fff;
+  border: 1px solid var(--steel); background: var(--steel); color: #fff; text-decoration: none;
 }
-button.act.ghost { background: none; color: var(--steel); }
+button.act.ghost, a.act.ghost { background: none; color: var(--steel); }
 button.act.stop { background: var(--signal); border-color: var(--signal); }
 button.act:disabled { opacity: .5; cursor: default; }
-button.act:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
-button.act.join { background: #1ab35a; border-color: #1ab35a; gap: 6px; display: inline-flex; align-items: center; }
-button.act.join svg { flex: none; }
+button.act:focus-visible, a.act:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+button.act.join, a.act.join { background: #1ab35a; border-color: #1ab35a; gap: 6px; display: inline-flex; align-items: center; }
+button.act.join svg, a.act.join svg { flex: none; }
 .dock-join { margin-top: 6px; }
 .dock-join a {
   display: inline-flex; align-items: center; gap: 6px;
@@ -153,6 +155,15 @@ button.act.join svg { flex: none; }
 .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
 .toolbar .path { font-size: 12px; color: var(--muted); margin-left: auto; }
 audio { width: 100%; margin-top: 14px; }
+/* Пару в Zoom обрывает через 30 минут, поэтому записей у одного занятия бывает
+   несколько. Кнопки переключают проигрыватель между ними. */
+.parts { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+.parts small { color: var(--steel); margin-right: 4px; }
+.parts button {
+  background: none; border: 1px solid var(--rule); color: var(--steel);
+  border-radius: 6px; padding: 3px 10px; font: inherit; font-size: 13px; cursor: pointer;
+}
+.parts button.on { border-color: var(--ink); color: var(--ink); }
 
 /* ---------- нижняя панель ---------- */
 .dock {
@@ -217,6 +228,7 @@ audio { width: 100%; margin-top: 14px; }
         <span class="path mono" id="path"></span>
       </div>
       <div id="note-body"></div>
+      <div id="parts" class="parts hidden"></div>
       <audio id="player" controls preload="none" class="hidden"></audio>
     </div>
   </section>
@@ -328,6 +340,30 @@ function drawDay() {
       a.className = "act join";
       a.innerHTML = joinIcon + "Войти";
       tags.appendChild(a);
+    }
+    // Код показываем прямо в карточке: когда Zoom его спросит, искать его
+    // по переписке уже некогда.
+    if (pair.passcode) {
+      const code = document.createElement("span");
+      code.className = "tag mono";
+      code.textContent = "код " + pair.passcode;
+      tags.appendChild(code);
+    }
+    if (pair.backup_link) {
+      const b = document.createElement("a");
+      b.href = pair.backup_link;
+      b.target = "_blank";
+      b.rel = "noopener noreferrer";
+      b.className = "act ghost";
+      b.textContent = "Запасная ссылка";
+      if (pair.backup_passcode) b.title = "код " + pair.backup_passcode;
+      tags.appendChild(b);
+      if (pair.backup_passcode) {
+        const code = document.createElement("span");
+        code.className = "tag mono";
+        code.textContent = "код запасной " + pair.backup_passcode;
+        tags.appendChild(code);
+      }
     }
     if (pair.recorded) {
       const btn = document.createElement("button");
@@ -463,7 +499,11 @@ async function refresh() {
 
 async function loadLectures() {
   const data = await api("/api/lectures");
-  for (const item of data.items) if (item.audio) lectureFiles[item.path] = `${item.path}/${item.audio}`;
+  // Звука у занятия может быть несколько файлов, если пару писали кусками
+  for (const item of data.items) {
+    const names = item.parts && item.parts.length ? item.parts : (item.audio ? [item.audio] : []);
+    lectureFiles[item.path] = names.map((n) => `${item.path}/${n}`);
+  }
   const box = $("lectures");
   box.innerHTML = "";
   if (!data.items.length) {
@@ -511,19 +551,46 @@ function drawLecture() {
     body.innerHTML = markdown(text);
   }
 
-  const audio = lecture.path && lectureAudio();
-  const player = $("player");
-  if (audio) {
-    player.src = `/api/audio?path=${encodeURIComponent(audio)}`;
-    player.classList.remove("hidden");
-  } else {
-    player.classList.add("hidden");
-  }
+  drawParts();
 }
 
 let lectureFiles = {};
+let currentPart = 0;
+
 function lectureAudio() {
-  return lectureFiles[lecture.path] || null;
+  return lectureFiles[lecture.path] || [];
+}
+
+function drawParts() {
+  const files = lecture.path ? lectureAudio() : [];
+  const box = $("parts");
+  const player = $("player");
+  box.innerHTML = "";
+  if (!files.length) {
+    box.classList.add("hidden");
+    player.classList.add("hidden");
+    return;
+  }
+  if (currentPart >= files.length) currentPart = 0;
+  player.src = `/api/audio?path=${encodeURIComponent(files[currentPart])}`;
+  player.classList.remove("hidden");
+
+  // Одна запись это обычный случай, переключать нечего
+  if (files.length < 2) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+  const label = document.createElement("small");
+  label.textContent = "Запись прерывалась, частей " + files.length + ":";
+  box.appendChild(label);
+  files.forEach((_, i) => {
+    const b = document.createElement("button");
+    b.textContent = String(i + 1);
+    if (i === currentPart) b.className = "on";
+    b.onclick = () => { currentPart = i; drawParts(); player.play(); };
+    box.appendChild(b);
+  });
 }
 
 const markTimestamps = (text) => text.replace(/\[(\d{2}:\d{2}:\d{2})\]/g, '<span class="stamp">[$1]</span>');
