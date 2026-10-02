@@ -534,6 +534,16 @@ SYSTEM_PROMPT = """\
 """
 
 
+def plain_dashes(text: str) -> str:
+    """
+    Длинные тире пользователь не использует нигде, и в инструкции модели об этом
+    сказано, но бесплатные модели эту просьбу пропускают: на проверке 02.10 одна
+    поставила 11 тире в один конспект. Поэтому чистим ответ сами, это надёжнее
+    любых слов в промпте. Заменяем на дефис, как пишет сам пользователь.
+    """
+    return text.replace("\u2014", "-").replace("\u2013", "-")
+
+
 def build_request(transcript: str, subject: str, when: datetime, cfg: dict,
                   meta: dict | None = None) -> str:
     parts = [f"Предмет: {subject}", f"Дата: {when:%d.%m.%Y}"]
@@ -1060,7 +1070,9 @@ def process_session(source: Path, subject: str, when: datetime, cfg: dict,
     header = "---\n" + "".join(
         f"{k}: {json.dumps(v, ensure_ascii=False)}\n" for k, v in fields.items()) + "---\n\n"
     notes_path = folder / "notes.md"
-    notes_path.write_text(header + notes.strip() + "\n", encoding="utf-8")
+    notes_path.write_text(header + plain_dashes(notes).strip() + "\n", encoding="utf-8")
+    # Запасной промпт от прошлой неудачной попытки больше не нужен
+    (folder / "prompt_for_claude.md").unlink(missing_ok=True)
     set_status("idle")
     print(f"Готово! Конспект: {notes_path}")
 
