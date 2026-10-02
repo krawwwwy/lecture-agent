@@ -49,7 +49,8 @@ DEFAULTS: dict = {
         "provider": "auto",  # auto / openrouter / claude_cli / gemini / anthropic
         "model": "claude-sonnet-5",
         "gemini_model": "gemini-2.5-flash",
-        "openrouter_model": "deepseek/deepseek-v4-flash-0731:free",
+        "openrouter_model": "",  # старое поле с одной моделью, читается для совместимости
+        "openrouter_models": [],  # пусто = очередь DEFAULT_OPENROUTER_MODELS
         "openrouter_free_only": True,
         "cli_model": "",
         "effort": "medium",
@@ -265,16 +266,69 @@ def merge_parts(folder: Path) -> str:
     return "\n\n".join(pieces)
 
 
+AUDIO_SUFFIXES = (".flac", ".webm", ".m4a", ".mp3", ".wav", ".ogg")
+# Сколько тишины считать концом пары. Zoom пересоздают за минуту-две,
+# а пары часто кончаются раньше расписания, и ждать до звонка незачем.
+PARTS_QUIET_MINUTES = 15
+
+
 def waiting_for_parts(folder: Path, tz) -> bool:
     """
-    Стоит ли ждать продолжения. Пока пара по расписанию не кончилась, конспект
-    делать рано: следующий кусок всё равно заставит переписывать его заново,
-    а это лишний запрос к модели на каждый обрыв связи.
+    Стоит ли ждать продолжения. Конспект по одному куску делать рано: следующий
+    кусок всё равно заставит переписывать его заново. Но и ждать конца пары по
+    расписанию нельзя: если преподаватель отпустил раньше, продолжения не будет
+    вовсе. Поэтому ждём, только пока пара не кончилась И запись была недавно.
     """
     end = load_parts(folder)["pair_end"]
     if not end:
         return False  # занятие вне расписания, продолжения не будет
-    return datetime.now(tz).replace(tzinfo=None) < datetime.fromisoformat(end)
+    if datetime.now(tz).replace(tzinfo=None) >= datetime.fromisoformat(end):
+        return False
+    newest = max((f.stat().st_mtime for f in folder.iterdir()
+                  if f.suffix.lower() in AUDIO_SUFFIXES), default=None)
+    if newest is None:
+        return False
+    return time.time() - newest < PARTS_QUIET_MINUTES * 60
+
+
+def folder_job_info(folder: Path) -> tuple[str, datetime, dict]:
+    """Предмет, дата и название занятия по одной только папке на диске."""
+    try:
+        when = datetime.strptime(folder.name[:10], "%Y-%m-%d")
+    except ValueError:
+        when = datetime.fromtimestamp(folder.stat().st_ctime)
+    return folder.parent.name, when, {"title": folder.name[11:] or folder.name}
+
+
+def pending_notes(cfg: dict, tz, busy: set | frozenset = frozenset()) -> list[Path]:
+    """
+    Пары из кусков, которые пора конспектировать: все куски расшифрованы,
+    продолжения ждать не нужно, а конспекта нет. Если конспект пытались
+    сделать и не смогли, рядом лежит prompt_for_claude.md, такие не трогаем:
+    иначе неработающая модель дёргалась бы каждые две минуты.
+    """
+    root = cfg["output_dir"]
+    found = []
+    if not root.exists():
+        return found
+    for marker in root.glob(f"*/*/{PARTS_FILE}"):
+        folder = marker.parent
+        if folder in busy:
+            continue  # туда прямо сейчас пишется кусок
+        if (folder / "notes.md").exists() or (folder / "prompt_for_claude.md").exists():
+            continue
+        transcript = folder / "transcript.txt"
+        if not transcript.exists() or not transcript.read_text(encoding="utf-8").strip():
+            continue
+        parts = load_parts(folder)["parts"]
+        # кусок без расшифровки ещё в очереди; seconds == 0 это выкинутый ложный старт
+        if not parts or any(p.get("seconds") != 0 and not (folder / f"part-{n}.txt").exists()
+                            for n, p in enumerate(parts, 1)):
+            continue
+        if waiting_for_parts(folder, tz):
+            continue
+        found.append(folder)
+    return found
 
 
 # ---------------------------------------------------------------- состояние для интерфейса
@@ -776,16 +830,44 @@ def ensure_free_model(model: str) -> None:
             "  Бесплатные перечислены здесь: openrouter.ai/models?max_price=0")
 
 
-def summarize_openrouter(request_text: str, cfg: dict, key: str) -> str:
-    """
-    Конспект через OpenRouter. Там есть модели с нулевой ценой, а сам сервис
-    отвечает оттуда, где Gemini и Groq уже закрыты по региону.
-    Формат запросов совместим с OpenAI, ответ читаем потоком.
-    """
+# Бесплатные модели на OpenRouter меняются каждые пару недель: одна исчезает из каталога,
+# другая упирается в лимит, третья вдруг становится «только для агентских программ».
+# Поэтому модель не одна, а очередь: агент идёт по ней, пока какая-то не справится.
+# Порядок по проверке 02.10.2026: сначала те, что отвечали по-русски быстро и связно.
+DEFAULT_OPENROUTER_MODELS = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "inclusionai/ling-3.0-flash-sante:free",
+    "qwen/qwen3.8-27b:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+]
+
+
+class ModelSkip(Exception):
+    """Эта модель сейчас не годится, но следующая в очереди может справиться."""
+
+
+def openrouter_models(cfg: dict) -> list[str]:
     s = cfg["summary"]
-    model = str(s.get("openrouter_model") or "deepseek/deepseek-v4-flash-0731:free")
-    if s.get("openrouter_free_only", True):
-        ensure_free_model(model)
+    raw = s.get("openrouter_models") or s.get("openrouter_model") or DEFAULT_OPENROUTER_MODELS
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(m).strip() for m in raw if str(m).strip()]
+
+
+def looks_like_notes(text: str) -> bool:
+    """
+    Бесплатные модели иногда отвечают пустотой, куском своих размышлений
+    или вовсе не по делу: одна на проверке вернула «User Safety: safe».
+    Конспект по нашей инструкции состоит из разделов с заголовками ##,
+    по ним и отличаем настоящий ответ от мусора.
+    """
+    sections = sum(1 for line in text.splitlines() if line.startswith("## "))
+    return len(text.strip()) >= 400 and sections >= 2
+
+
+def openrouter_once(request_text: str, cfg: dict, key: str, model: str) -> str:
+    """Одна попытка с одной моделью. ModelSkip значит «пробуй следующую»."""
+    s = cfg["summary"]
     body = {
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT},
@@ -796,8 +878,10 @@ def summarize_openrouter(request_text: str, cfg: dict, key: str) -> str:
     http = urllib.request.Request(
         OPENROUTER_URL, data=json.dumps(body).encode("utf-8"), method="POST",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                 # OpenRouter просит представляться, чтобы считать статистику
-                 "X-Title": "lecture-agent"})
+                 # Без своего User-Agent запрос уходит как Python-urllib, а такие
+                 # защита сайтов любит отбивать: 21.09 пришло «Access denied by
+                 # security policy». X-Title OpenRouter просит для статистики.
+                 "User-Agent": "lecture-agent/1.0", "X-Title": "lecture-agent"})
 
     print(f"Пишу конспект ({model})...")
     set_status("summary", "", None)
@@ -817,6 +901,8 @@ def summarize_openrouter(request_text: str, cfg: dict, key: str) -> str:
                     event = json.loads(payload)
                 except ValueError:
                     continue
+                if isinstance(event.get("error"), dict):  # ошибка посреди потока
+                    raise ModelSkip(str(event["error"].get("message") or "ошибка в потоке")[:120])
                 for choice in event.get("choices", []):
                     finish = choice.get("finish_reason") or finish
                     text = (choice.get("delta") or {}).get("content")
@@ -831,27 +917,49 @@ def summarize_openrouter(request_text: str, cfg: dict, key: str) -> str:
             detail = json.loads(raw)["error"]["message"]
         except Exception:
             detail = raw[:300]
-        low = detail.lower()
-        if err.code == 401 or "no auth" in low or "invalid" in low and "key" in low:
+        low = str(detail).lower()
+        if err.code == 401 or "no auth" in low or ("invalid" in low and "key" in low):
+            # с неверным ключом остальные модели не помогут, дальше не идём
             raise RuntimeError("OpenRouter не принял ключ. Проверь OPENROUTER_API_KEY, "
                                "он начинается на sk-or-.") from None
-        if err.code == 402 or "credit" in low:
-            raise RuntimeError("OpenRouter: на бесплатной модели кончилась дневная квота. "
-                               "Попробуй позже или поставь другую модель с «:free».") from None
-        if err.code == 404:
-            raise RuntimeError(f"OpenRouter не знает модель «{model}». Список бесплатных: "
-                               "openrouter.ai/models?max_price=0") from None
-        if err.code == 429:
-            raise RuntimeError("OpenRouter: слишком часто. Подожди минуту.") from None
-        raise RuntimeError(f"OpenRouter ответил {err.code}: {detail}") from None
+        reasons = {402: "кончилась квота", 403: "закрыта для таких запросов",
+                   404: "пропала из каталога", 429: "перегружена, лимит запросов"}
+        reason = reasons.get(err.code) or ("сбой на стороне сервиса" if err.code >= 500
+                                           else f"ответ {err.code}")
+        raise ModelSkip(f"{reason}: {str(detail)[:90]}") from None
     print()
+    notes = "".join(chunks)
+    if not looks_like_notes(notes):
+        raise ModelSkip("ответ не похож на конспект" if notes.strip() else "пустой ответ")
     if finish == "length":
         print("  Внимание: ответ упёрся в лимит, конспект может быть обрезан. "
               "Увеличь summary.max_tokens в config.yaml.")
-    if not chunks:
-        raise RuntimeError("OpenRouter вернул пустой ответ. Обычно это перегруженная "
-                           "бесплатная модель, попробуй ещё раз или смени её.")
-    return "".join(chunks)
+    return notes
+
+
+def summarize_openrouter(request_text: str, cfg: dict, key: str) -> str:
+    """
+    Конспект через OpenRouter. Там есть модели с нулевой ценой, а сам сервис
+    отвечает оттуда, где Gemini и Groq закрыты по региону. Модели перебираются
+    по очереди из config.yaml, пока одна не справится.
+    """
+    free_only = cfg["summary"].get("openrouter_free_only", True)
+    tried: list[tuple[str, str]] = []
+    for model in openrouter_models(cfg):
+        if free_only:
+            try:
+                ensure_free_model(model)
+            except RuntimeError:
+                tried.append((model, "платная, а разрешены только бесплатные"))
+                continue
+        try:
+            return openrouter_once(request_text, cfg, key, model)
+        except ModelSkip as why:
+            print(f"\n  {model}: {why}. Пробую следующую.")
+            tried.append((model, str(why)))
+    listing = "\n".join(f"  {m}: {r}" for m, r in tried)
+    raise RuntimeError("ни одна модель из очереди не справилась:\n" + listing +
+                       "\n  Какие бесплатные модели отвечают сейчас: python agent.py models")
 
 
 def summarize(request: str, cfg: dict) -> str:
@@ -898,6 +1006,11 @@ def process_session(source: Path, subject: str, when: datetime, cfg: dict,
         if part:
             (folder / f"part-{part}.txt").write_text(text, encoding="utf-8")
             transcript = merge_parts(folder)
+            # Конспект мог успеть сделаться по первым кускам, если перерыв был
+            # долгим. Теперь он описывает не всю пару, так что убираем его,
+            # а новый сделает либо этот вызов, либо проверка отложенных.
+            for stale in ("notes.md", "prompt_for_claude.md"):
+                (folder / stale).unlink(missing_ok=True)
         else:
             transcript = text
         (folder / "transcript.txt").write_text(transcript, encoding="utf-8")
@@ -1742,6 +1855,43 @@ def run_server(cfg: dict, open_browser: bool = False) -> None:
             else:
                 self.reply(404, {"error": "unknown endpoint"})
 
+    queued_notes: set[Path] = set()
+
+    def sweep_deferred() -> None:
+        """
+        Будит отложенные конспекты. Кусок пары откладывает конспект, пока пара
+        может продолжиться, а если продолжения так и не было, будить его больше
+        некому: следующий кусок не придёт. Эта проверка и есть будильник.
+        """
+        tz = meta["tz"] if meta else timezone.utc
+        # Обработанные отпускаем: если потом придёт ещё кусок и старый конспект
+        # удалится, папку нужно будет поставить в очередь заново.
+        queued_notes.difference_update({f for f in queued_notes if (f / "notes.md").exists()
+                                        or (f / "prompt_for_claude.md").exists()})
+        with lock:
+            busy = {s["folder"] for s in sessions.values()}
+        if mic["active"] and mic["folder"]:
+            busy.add(mic["folder"])
+        for folder in pending_notes(cfg, tz, busy):
+            if folder in queued_notes:
+                continue
+            queued_notes.add(folder)
+            subject, when, info = folder_job_info(folder)
+            print(f"[{datetime.now(tz):%H:%M}] «{subject}» больше не пишется, "
+                  "делаю конспект по всем частям.")
+            jobs.put({"source": folder / "transcript.txt", "subject": subject, "when": when,
+                      "cfg": cfg, "folder": folder, "meta": info})
+
+    def sweeper() -> None:
+        while True:
+            try:
+                sweep_deferred()
+            except Exception as e:  # проверка не должна ронять сервер
+                print(f"[отложенные конспекты] {e}")
+            time.sleep(120)
+
+    threading.Thread(target=sweeper, daemon=True).start()
+
     # На Windows SO_REUSEADDR разрешает второму процессу занять уже занятый порт,
     # и тогда два агента молча делят запросы между собой. Выключаем, чтобы второй
     # честно падал с ошибкой. На остальных системах оставляем: там этот флаг
@@ -2037,16 +2187,88 @@ def cmd_notes(args, cfg: dict) -> None:
 
     for subject, session, transcript in todo:
         print(f"\n=== {subject} / {session.name} ===")
+        _, when, info = folder_job_info(session)
         try:
-            when = datetime.strptime(session.name[:10], "%Y-%m-%d")
-        except ValueError:
-            when = datetime.fromtimestamp(session.stat().st_ctime)
-        try:
-            process_session(transcript, subject, when, cfg, session,
-                            make_notes=True, meta={"title": session.name[11:] or session.name})
+            process_session(transcript, subject, when, cfg, session, make_notes=True, meta=info)
         except Exception as e:
             print(f"  не получилось: {e}")
     print("\nГотово.")
+
+
+def cmd_models(args, cfg: dict) -> None:
+    """
+    Какие бесплатные модели OpenRouter отвечают прямо сейчас. Каталог меняется
+    каждые пару недель, и без такой проверки очередь в config.yaml пришлось бы
+    обновлять наугад.
+    """
+    request = urllib.request.Request(OPENROUTER_MODELS_URL,
+                                     headers={"User-Agent": "lecture-agent/1.0"})
+    with open_with_retry(request, timeout=60) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    free = []
+    for item in data.get("data") or data.get("models") or []:
+        pricing = item.get("pricing") or {}
+        try:
+            price = float(pricing.get("prompt") or 0) + float(pricing.get("completion") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price == 0 and str(item.get("id", "")).endswith(":free"):
+            free.append((int(item.get("context_length") or 0), item["id"]))
+    free.sort(reverse=True)
+    print(f"Бесплатных моделей в каталоге: {len(free)}")
+
+    key = openrouter_key(cfg)
+    if not key:
+        for ctx, mid in free:
+            print(f"  {ctx:>9,}  {mid}")
+        print("\nКлюча OPENROUTER_API_KEY нет, поэтому проверить, какие отвечают, нельзя.")
+        return
+
+    print("Проверяю каждую коротким заданием в формате конспекта.\n")
+    probe = ("Ответь по-русски двумя разделами с заголовками второго уровня: "
+             "«## Кратко» с одним предложением о том, что такое предел "
+             "последовательности, и «## Термины» с одним термином.")
+    working, busy = [], []
+    for ctx, mid in free:
+        body = {"model": mid, "max_tokens": 1500,
+                "messages": [{"role": "user", "content": probe}]}
+        http = urllib.request.Request(
+            OPENROUTER_URL, data=json.dumps(body).encode("utf-8"), method="POST",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                     "User-Agent": "lecture-agent/1.0", "X-Title": "lecture-agent"})
+        started = time.time()
+        try:
+            with open_with_retry(http, timeout=120) as resp:
+                reply = json.loads(resp.read().decode("utf-8"))
+            answer = (reply.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            sections = sum(1 for line in answer.splitlines() if line.startswith("## "))
+            cyrillic = sum(1 for ch in answer.lower() if "а" <= ch <= "я")
+            if sections >= 2 and cyrillic > 20:
+                verdict = "годится"
+                working.append(mid)
+            else:
+                verdict = "отвечает не по формату" if answer.strip() else "пустой ответ"
+        except urllib.error.HTTPError as err:
+            if err.code == 429:
+                busy.append(mid)
+            verdict = {402: "кончилась квота", 403: "закрыта для таких запросов",
+                       404: "пропала из каталога", 429: "перегружена"}.get(
+                err.code, f"ошибка {err.code}")
+        except Exception as err:
+            verdict = f"не ответила ({type(err).__name__})"
+        print(f"  {ctx:>9,}  {mid:52} {time.time() - started:5.1f} с  {verdict}")
+
+    if not working:
+        print("\nНи одна бесплатная модель сейчас не справилась. Попробуй позже.")
+        return
+    print("\nОчередь для config.yaml, раздел summary (лучшие сверху):\n")
+    print("  openrouter_models:")
+    for mid in working:
+        print(f"    - {mid}")
+    if busy:
+        print("\nПерегружены прямо сейчас, но могут ожить, их можно дописать в конец:")
+        for mid in busy:
+            print(f"    - {mid}")
 
 
 def cmd_process(args, cfg: dict) -> None:
@@ -2092,6 +2314,8 @@ def main() -> None:
     nts.add_argument("--apply", action="store_true", help="не показать, а правда сделать")
     nts.add_argument("--all", action="store_true", help="переписать и уже готовые конспекты")
 
+    sub.add_parser("models", help="какие бесплатные модели OpenRouter отвечают прямо сейчас")
+
     sub.add_parser("schedule", help="самому записывать очные пары по расписанию")
     sub.add_parser("ui", help="открыть приложение в браузере (расписание, запись, конспекты)")
     sub.add_parser("serve", help="то же самое, но без открытия браузера")
@@ -2112,6 +2336,8 @@ def main() -> None:
         cmd_merge(args, cfg)
     elif args.command == "notes":
         cmd_notes(args, cfg)
+    elif args.command == "models":
+        cmd_models(args, cfg)
     elif args.command == "schedule":
         run_schedule(cfg)
     elif args.command in ("serve", "ui"):

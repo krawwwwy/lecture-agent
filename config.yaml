@@ -39,9 +39,15 @@ summary:
   gemini_model: gemini-2.5-flash  # если provider = gemini
   cli_model: ""                   # если provider = claude_cli, пусто = модель из Claude Code
 
-  # если provider = openrouter. Суффикс :free означает бесплатную модель,
-  # список: openrouter.ai/models?max_price=0
-  openrouter_model: deepseek/deepseek-v4-flash-0731:free
+  # если provider = openrouter: очередь моделей, агент идёт по ней сверху вниз,
+  # пока какая-то не справится. Бесплатные модели там меняются каждые пару недель,
+  # поэтому одна модель рано или поздно пропадёт. Какие отвечают прямо сейчас,
+  # покажет команда: python agent.py models
+  openrouter_models:
+    - nvidia/nemotron-3-ultra-550b-a55b:free
+    - inclusionai/ling-3.0-flash-sante:free
+    - qwen/qwen3.8-27b:free
+    - nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
   # Страховка от случайной траты денег: перед запросом агент сверяется
   # с прайс-листом OpenRouter и отказывается работать с платной моделью
   openrouter_free_only: true
